@@ -1,6 +1,5 @@
 -- aminor
 -- v1.0.0 @bobodrone
--- llllllll.co/t/22222
 --
 -- a random sine note generator
 --
