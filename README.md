@@ -22,6 +22,31 @@ the last note has fully ended it shows **`The End`**.
 fade-out** — all sounding notes are released together over ~1.5 s (set by
 `FAST_FADE` in `aminor.lua`) instead of finishing their full envelopes.
 
+## Grid
+
+A 16×8 varibright grid is optional. Every control is lit from the current
+value, so changes made with the encoders or in the PARAMS menu show up too.
+
+| Cells | Control |
+|-------|---------|
+| row 1, cols 1–16 | number of voices: `1 2 3 4 5 6 8 10 12 15 18 22 26 31 36 42` |
+| row 2, cols 1–16 | master amplitude, 0.0 (left) to 1.0 (right) |
+| rows 3–8, cols 1–5 | octave 1–6 weight: `0 1 2 3 5` |
+| cols 7–13, rows 8–3 | note weight for `a b c d e f g#`, bottom to top: `0 1 2 3 5 8` |
+| col 16, rows 4–6 | waveform: pulse, saw, sine |
+| col 16, row 8 | on/off |
+
+Faders light as a bar from their origin (left end of a row, bottom end of a
+column) up to the current value. A value between two steps, such as 7 voices
+set with E2, shows as the step below.
+
+The on/off button starts when at rest, stops gracefully when playing, and
+does the fast fade-out when pressed again while stopping. Its LED is bright
+while playing, pulses while notes ring out, and is dim at rest.
+
+The step tables and LED levels are constants at the top of `aminor.lua`
+(`VOICE_STEPS`, `OCTAVE_STEPS`, `NOTE_STEPS`, `LED_DIM`, `LED_ON`).
+
 ## What one voice does each cycle
 
 1. pick a **weighted** random pitch (see weights below)
@@ -40,6 +65,7 @@ notes have the same shape.
 
 Everything below lives under **PARAMS > EDIT** and is saved with the pset:
 
+- **mix > voices / amp** — the same values as E2 and E3.
 - **oscillator > waveform** — `sine`, `saw`, or `pulse` (shared by all notes).
 - **envelope (seconds)** — a **min** and **max** for each of fade in, sustain,
   fade out, and pause. Set min = max to make a stage fixed.
@@ -89,7 +115,7 @@ them.
 | File | Language | Role |
 |------|----------|------|
 | `Engine_SineNote.sc` | SuperCollider | Makes the sound. Defines the oscillator + envelope `SynthDef` (sine/saw/pulse via `Select.ar`), a shared master-amplitude bus, and a gated release for the fast fade-out. Exposes `playNote(freq, fadeIn, sustain, fadeOut, wave)`, `setAmp(level)`, and `releaseAll(relTime)`. |
-| `aminor.lua` | Lua | The interface + logic. Handles keys/encoders, draws the screen, picks weighted notes, runs the voice loops, and calls the engine commands. |
+| `aminor.lua` | Lua | The interface + logic. Handles keys/encoders/grid, draws the screen, picks weighted notes, runs the voice loops, and calls the engine commands. |
 
 They are linked by two matching names:
 

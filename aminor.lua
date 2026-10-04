@@ -16,6 +16,17 @@
 -- K3 : start
 -- K2 : stop (press again while
 --      stopping for a fast fade-out)
+--
+-- grid (16x8, optional):
+-- row 1    : number of voices
+-- row 2    : master amplitude
+-- rows 3-8 : octave 1-6 weights
+--            (cols 1-5 = 0 1 2 3 5)
+-- cols 7-13: note weights a..g#
+--            (bottom to top =
+--             0 1 2 3 5 8)
+-- col 16   : rows 4-6 waveform,
+--            row 8 on/off
 
 -- Tell norns which SuperCollider engine to load.
 -- This must match the class name Engine_SineNote in Engine_SineNote.sc
@@ -81,6 +92,25 @@ local VOICES_MAX = 42
 -- seconds for the "fast fade-out" (second K2 press while stopping)
 local FAST_FADE = 1.5
 
+-- grid: the value each cell of a stepped fader stands for, counted from
+-- the fader's origin (left end of a row, bottom end of a column).
+-- voices get a curve so every low count is reachable; E2 still hits the
+-- values in between.
+local VOICE_STEPS  = {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 22, 26, 31, 36, 42}
+local OCTAVE_STEPS = {0, 1, 2, 3, 5}
+local NOTE_STEPS   = {0, 1, 2, 3, 5, 8}
+
+-- grid: how many cells the (linear) amplitude fader has
+local AMP_CELLS = 16
+
+-- grid: led brightness (0-15) for an unlit track cell and a lit cell
+local LED_DIM = 3
+local LED_ON  = 15
+
+-- grid: redraws per second, and how fast the on/off led pulses while stopping
+local GRID_FPS = 30
+local PULSE_HZ = 1
+
 -- the envelope stages we expose as min/max params.
 -- { id, display name, spec min, spec max, default min, default max }
 local STAGES = {
@@ -96,12 +126,14 @@ local STAGES = {
 
 local voices  = {}           -- clock ids of the active voice loops
 local n_live  = 0            -- how many voice loops are still alive
-local target_voices = 1      -- how many voices we want (E2)
-local master_amp = 0.5       -- overall level (E3)
+local target_voices = 1      -- how many voices we want ("voices" param)
+local master_amp = 0.5       -- overall level ("amp" param)
 local last_note = ""         -- text of the most recently triggered note
 local playing  = false       -- generating new notes?
 local stopping = false       -- stopped, but notes still fading out
 local ended    = false       -- everything has finished ("The End")
+local g                      -- the connected grid
+local grid_dirty = true      -- grid leds need repainting?
 
 -- ----------------------------------------------------------------------
 -- helpers
@@ -155,6 +187,14 @@ local function rand_stage(id)
   return lo + math.random() * (hi - lo)
 end
 
+-- something changed: repaint the screen and flag the grid for a repaint.
+-- (the flag is set here rather than in redraw() because norns swaps
+-- redraw() out while the menu is open.)
+local function refresh()
+  grid_dirty = true
+  redraw()
+end
+
 -- called when a voice loop has finished (it and its last note are done).
 -- when the final voice ends during a stop, flip the display to "The End".
 local function voice_ended()
@@ -164,7 +204,7 @@ local function voice_ended()
     ended = true
     last_note = ""
     voices = {}
-    redraw()
+    refresh()
   end
 end
 
@@ -240,7 +280,7 @@ local function start()
   stopping = false
   ended = false
   match_voices()
-  redraw()
+  refresh()
 end
 
 local function stop()
@@ -256,7 +296,7 @@ local function stop()
     ended = true
     voices = {}
   end
-  redraw()
+  refresh()
 end
 
 -- fast fade-out: cut scheduling immediately and release every sounding note
@@ -270,7 +310,7 @@ local function fast_stop()
   n_live = 0
   stopping = true
   ended = false
-  redraw()                       -- keeps showing "stopping.."
+  refresh()                      -- keeps showing "stopping.."
   engine.releaseAll(FAST_FADE)   -- tell the engine to fade all notes out
   -- flip to "The End" once the fade has finished
   clock.run(function()
@@ -279,9 +319,162 @@ local function fast_stop()
       stopping = false
       ended = true
       last_note = ""
-      redraw()
+      refresh()
     end
   end)
+end
+
+-- one button for everything: start when at rest, graceful stop when
+-- playing, fast fade-out when already stopping (same as K3 / K2 / K2).
+local function toggle_play()
+  if playing then
+    stop()
+  elseif stopping then
+    fast_stop()
+  else
+    start()
+  end
+end
+
+-- ----------------------------------------------------------------------
+-- grid: scaling helpers
+-- ----------------------------------------------------------------------
+
+-- linear fader: cell i of n (1-based) -> a value in [lo, hi], and back.
+local function cell_to_value(i, n, lo, hi)
+  return util.linlin(1, n, lo, hi, i)
+end
+
+local function value_to_cell(v, n, lo, hi)
+  return util.round(util.linlin(lo, hi, 1, n, v))
+end
+
+-- stepped fader: cell i -> steps[i], and back. going back picks the
+-- highest step that is <= v, so in-between values (set with an encoder
+-- or in the PARAMS menu) show as the step below.
+local function step_to_value(steps, i)
+  return steps[util.clamp(i, 1, #steps)]
+end
+
+local function value_to_step(steps, v)
+  local cell = 1
+  for i, step in ipairs(steps) do
+    if v >= step then cell = i end
+  end
+  return cell
+end
+
+-- ----------------------------------------------------------------------
+-- grid: led helpers
+-- ----------------------------------------------------------------------
+
+-- a "line" is n cells starting at (x, y) and stepping by (dx, dy), so the
+-- same helpers serve rows (dx = 1) and columns (dy = -1 runs upwards).
+-- which cell of the line (1-based) sits at grid position (px, py)? nil = none.
+local function line_cell(line, px, py)
+  for i = 1, line.n do
+    if px == line.x + (i - 1) * line.dx and py == line.y + (i - 1) * line.dy then
+      return i
+    end
+  end
+end
+
+-- set every cell of a line; level_for(i) gives the brightness of cell i.
+local function led_line(line, level_for)
+  for i = 1, line.n do
+    g:led(line.x + (i - 1) * line.dx, line.y + (i - 1) * line.dy, level_for(i))
+  end
+end
+
+-- fader look: cells 1..lit bright, the rest of the track dim.
+local function led_bar(line, lit)
+  led_line(line, function(i) return i <= lit and LED_ON or LED_DIM end)
+end
+
+-- selector look: only the selected cell bright, the others dim.
+local function led_radio(line, selected)
+  led_line(line, function(i) return i == selected and LED_ON or LED_DIM end)
+end
+
+-- brightness that swings between dim and bright, for "busy" indication.
+local function led_pulse()
+  local phase = math.sin(util.time() * 2 * math.pi * PULSE_HZ)
+  return util.round(util.linlin(-1, 1, LED_DIM, LED_ON, phase))
+end
+
+-- ----------------------------------------------------------------------
+-- grid: layout
+-- ----------------------------------------------------------------------
+
+-- every control is a line of cells plus:
+--   press(i) : cell i of the line was pressed
+--   draw()   : light the line's leds from the current state
+local controls = {}
+
+local function add_control(x, y, dx, dy, n, press, draw)
+  local c = {x = x, y = y, dx = dx, dy = dy, n = n, press = press}
+  c.draw = function() draw(c) end
+  controls[#controls + 1] = c
+end
+
+-- a bar fader over a number param, one cell per entry in `steps`.
+local function add_step_fader(x, y, dx, dy, steps, id)
+  add_control(x, y, dx, dy, #steps,
+    function(i) params:set(id, step_to_value(steps, i)) end,
+    function(c) led_bar(c, value_to_step(steps, params:get(id))) end)
+end
+
+local function build_controls()
+  -- row 1: number of voices
+  add_step_fader(1, 1, 1, 0, VOICE_STEPS, "voices")
+
+  -- row 2: master amplitude, 0.0 (left) to 1.0 (right)
+  add_control(1, 2, 1, 0, AMP_CELLS,
+    function(i) params:set("amp", cell_to_value(i, AMP_CELLS, 0, 1)) end,
+    function(c) led_bar(c, value_to_cell(params:get("amp"), AMP_CELLS, 0, 1)) end)
+
+  -- rows 3-8, cols 1-5: one weight fader per octave
+  for row, o in ipairs(OCTAVES) do
+    add_step_fader(1, 2 + row, 1, 0, OCTAVE_STEPS, "octw_" .. o[1])
+  end
+
+  -- cols 7-13: one weight fader per note, running up from row 8
+  for col, n in ipairs(NOTES) do
+    add_step_fader(6 + col, 8, 0, -1, NOTE_STEPS, "weight_" .. n[2])
+  end
+
+  -- col 16, rows 4-6: waveform, listed top to bottom as pulse / saw / sine
+  -- (the reverse of WAVES, hence the flip)
+  add_control(16, 4, 0, 1, #WAVES,
+    function(i) params:set("waveform", #WAVES + 1 - i) end,
+    function(c) led_radio(c, #WAVES + 1 - params:get("waveform")) end)
+
+  -- col 16, row 8: on/off. bright = playing, pulsing = stopping, dim = at rest
+  add_control(16, 8, 0, 0, 1,
+    function() toggle_play() end,
+    function(c)
+      local level = LED_DIM
+      if playing then level = LED_ON elseif stopping then level = led_pulse() end
+      led_line(c, function() return level end)
+    end)
+end
+
+local function grid_redraw()
+  g:all(0)
+  for _, c in ipairs(controls) do c.draw() end
+  g:refresh()
+end
+
+-- grid keys: z = 1 pressed / 0 released. find the control under the press.
+local function grid_key(x, y, z)
+  if z == 0 then return end
+  for _, c in ipairs(controls) do
+    local i = line_cell(c, x, y)
+    if i then
+      c.press(i)
+      return
+    end
+  end
 end
 
 -- ----------------------------------------------------------------------
@@ -291,9 +484,25 @@ end
 function init()
   math.randomseed(os.time())
 
+  -- voice count and master level (also on E2 / E3 and the grid).
+  params:add_separator("mix")
+  params:add_number("voices", "voices", VOICES_MIN, VOICES_MAX, target_voices)
+  params:set_action("voices", function(v)
+    target_voices = v
+    match_voices()
+    refresh()
+  end)
+  params:add_control("amp", "amp", controlspec.new(0, 1, "lin", 0.01, master_amp))
+  params:set_action("amp", function(v)
+    master_amp = v
+    engine.setAmp(master_amp)
+    refresh()
+  end)
+
   -- oscillator waveform (shared by every note).
   params:add_separator("oscillator")
   params:add_option("waveform", "waveform", WAVES, 1)
+  params:set_action("waveform", refresh)
 
   -- one min + one max control param per envelope stage.
   -- these show up under PARAMS > EDIT and are saved with the pset.
@@ -311,6 +520,7 @@ function init()
   for _, n in ipairs(NOTES) do
     local name, id, default = table.unpack(n)
     params:add_number("weight_" .. id, "weight " .. name, 0, 20, default)
+    params:set_action("weight_" .. id, refresh)
   end
 
   -- one integer weight per octave (0 = octave never used).
@@ -318,26 +528,44 @@ function init()
   for _, o in ipairs(OCTAVES) do
     local octave, default = table.unpack(o)
     params:add_number("octw_" .. octave, "weight oct " .. octave, 0, 20, default)
+    params:set_action("octw_" .. octave, refresh)
   end
 
-  -- push the starting master amplitude to the engine
-  engine.setAmp(master_amp)
+  -- grid: connect, lay out the controls, and repaint the leds whenever
+  -- something changed (or constantly while the on/off led is pulsing).
+  g = grid.connect()
+  g.key = grid_key
+  grid.add = function() grid_dirty = true end
+  build_controls()
+  clock.run(function()
+    while true do
+      clock.sleep(1 / GRID_FPS)
+      if grid_dirty or stopping then
+        grid_dirty = false
+        grid_redraw()
+      end
+    end
+  end)
 
-  redraw()
+  -- run every param action once: pushes the starting master amplitude to
+  -- the engine and draws the screen
+  params:bang()
+end
+
+-- called by norns when the script is unloaded: leave the grid dark.
+function cleanup()
+  g:all(0)
+  g:refresh()
 end
 
 -- encoders: n = which encoder (1,2,3), d = delta (+/-)
 function enc(n, d)
   if n == 2 then
     -- E2: number of simultaneous voices
-    target_voices = util.clamp(target_voices + d, VOICES_MIN, VOICES_MAX)
-    match_voices()
-    redraw()
+    params:delta("voices", d)
   elseif n == 3 then
     -- E3: overall amplitude / master mix level
-    master_amp = util.clamp(master_amp + d * 0.01, 0, 1)
-    engine.setAmp(master_amp)
-    redraw()
+    params:delta("amp", d)
   end
 end
 
